@@ -32,6 +32,8 @@ import org.apache.lucene.index.DocValues.Type;
 import org.apache.lucene.queries.function.ValueSource;
 import org.apache.lucene.queries.function.valuesource.BytesRefFieldSource;
 import org.apache.lucene.search.*;
+import org.apache.lucene.search.grouping.docscores.DocScoresFirstPassGroupingCollector;
+import org.apache.lucene.search.grouping.docscores.DocScoresGroupComparator;
 import org.apache.lucene.search.grouping.dv.DVAllGroupsCollector;
 import org.apache.lucene.search.grouping.dv.DVFirstPassGroupingCollector;
 import org.apache.lucene.search.grouping.dv.DVSecondPassGroupingCollector;
@@ -171,6 +173,119 @@ public class TestGrouping extends LuceneTestCase {
     indexSearcher.getIndexReader().close();
     dir.close();
   }
+  
+  public void testDocScoresGroupSorting() throws Exception {
+
+    final String groupField = "author";
+
+    FieldType customType = new FieldType();
+    customType.setStored(true);
+
+    Directory dir = newDirectory();
+    RandomIndexWriter w = new RandomIndexWriter(
+                               random,
+                               dir,
+                               newIndexWriterConfig(TEST_VERSION_CURRENT,
+                                                    new MockAnalyzer(random)).setMergePolicy(newLogMergePolicy()));
+    boolean canUseIDV = !"Lucene3x".equals(w.w.getConfig().getCodec().getName());
+    // 0
+    Document doc = new Document();
+    addGroupField(doc, groupField, "author1", canUseIDV);
+    doc.add(new Field("content", "random text", TextField.TYPE_STORED));
+    doc.add(new Field("id", "1", customType));
+    w.addDocument(doc);
+
+    // 1
+    doc = new Document();
+    addGroupField(doc, groupField, "author1", canUseIDV);
+    doc.add(new Field("content", "some more random text", TextField.TYPE_STORED));
+    doc.add(new Field("id", "2", customType));
+    w.addDocument(doc);
+
+    // 2
+    doc = new Document();
+    addGroupField(doc, groupField, "author1", canUseIDV);
+    doc.add(new Field("content", "some more random textual data", TextField.TYPE_STORED));
+    doc.add(new Field("id", "3", customType));
+    w.addDocument(doc);
+
+    // 3
+    doc = new Document();
+    addGroupField(doc, groupField, "author2", canUseIDV);
+    doc.add(new Field("content", "some random text", TextField.TYPE_STORED));
+    doc.add(new Field("id", "4", customType));
+    w.addDocument(doc);
+
+    // 4
+    doc = new Document();
+    addGroupField(doc, groupField, "author3", canUseIDV);
+    doc.add(new Field("content", "some more random text", TextField.TYPE_STORED));
+    doc.add(new Field("id", "5", customType));
+    w.addDocument(doc);
+
+    // 5
+    doc = new Document();
+    addGroupField(doc, groupField, "author3", canUseIDV);
+    doc.add(new Field("content", "random", TextField.TYPE_STORED));
+    doc.add(new Field("id", "6", customType));
+    w.addDocument(doc);
+
+    // 6 -- no author field
+    doc = new Document();
+    doc.add(new Field("content", "random word stuck in alot of other text", TextField.TYPE_STORED));
+    doc.add(new Field("id", "6", customType));
+    w.addDocument(doc);
+
+    IndexSearcher indexSearcher = new IndexSearcher(w.getReader());
+    w.close();
+
+    final Sort groupSort = Sort.RELEVANCE;
+    final DocScoresFirstPassGroupingCollector c1 = DocScoresFirstPassGroupingCollector.create(DocScoresGroupComparator.Type.SUM, groupField, 10);
+    indexSearcher.search(new TermQuery(new Term("content", "random")), c1);
+
+    final AbstractSecondPassGroupingCollector c2 = createSecondPassCollector(c1, groupField, groupSort, null, 0, 5, true, false, true);
+    indexSearcher.search(new TermQuery(new Term("content", "random")), c2);
+
+    final TopGroups groups = c2.getTopGroups(0);
+
+    assertEquals(7, groups.totalHitCount);
+    assertEquals(7, groups.totalGroupedHitCount);
+    assertEquals(4, groups.groups.length);
+
+    // group order: author1, author3, author2, null
+    // relevance order: 5, 0, 3, 4, 1, 2, 6
+
+    // the later a document is added the higher this docId
+    // value
+    GroupDocs group = groups.groups[0];
+    compareGroupValue("author1", group);
+    assertEquals(3, group.scoreDocs.length);
+    assertEquals(0, group.scoreDocs[0].doc);
+    assertEquals(1, group.scoreDocs[1].doc);
+    assertEquals(2, group.scoreDocs[2].doc);
+    assertTrue(group.scoreDocs[0].score > group.scoreDocs[1].score);
+    assertTrue(group.scoreDocs[1].score > group.scoreDocs[2].score);
+
+    group = groups.groups[1];
+    compareGroupValue("author3", group);
+    assertEquals(2, group.scoreDocs.length);
+    assertEquals(5, group.scoreDocs[0].doc);
+    assertEquals(4, group.scoreDocs[1].doc);
+    assertTrue(group.scoreDocs[0].score > group.scoreDocs[1].score);    
+
+    group = groups.groups[2];
+    compareGroupValue("author2", group);
+    assertEquals(1, group.scoreDocs.length);
+    assertEquals(3, group.scoreDocs[0].doc);
+
+    group = groups.groups[3];
+    compareGroupValue(null, group);
+    assertEquals(1, group.scoreDocs.length);
+    assertEquals(6, group.scoreDocs[0].doc);
+
+    indexSearcher.getIndexReader().close();
+    dir.close();
+  }
 
   private void addGroupField(Document doc, String groupField, String value, boolean canUseIDV) {
     doc.add(new Field(groupField, value, TextField.TYPE_STORED));
@@ -209,7 +324,7 @@ public class TestGrouping extends LuceneTestCase {
   }
 
   @SuppressWarnings("unchecked")
-  private AbstractSecondPassGroupingCollector createSecondPassCollector(AbstractFirstPassGroupingCollector firstPassGroupingCollector,
+  private AbstractSecondPassGroupingCollector createSecondPassCollector(Collector firstPassGroupingCollector,
                                                                         String groupField,
                                                                         Sort groupSort,
                                                                         Sort sortWithinGroup,
@@ -221,14 +336,17 @@ public class TestGrouping extends LuceneTestCase {
 
     if (DVFirstPassGroupingCollector.class.isAssignableFrom(firstPassGroupingCollector.getClass())) {
       boolean diskResident = random.nextBoolean();
-      Collection<SearchGroup> searchGroups = firstPassGroupingCollector.getTopGroups(groupOffset, fillSortFields);
+      Collection<SearchGroup> searchGroups = ((AbstractFirstPassGroupingCollector)firstPassGroupingCollector).getTopGroups(groupOffset, fillSortFields);
       return DVSecondPassGroupingCollector.create(groupField, diskResident, Type.BYTES_VAR_SORTED, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup, getScores, getMaxScores, fillSortFields);
     } else if (TermFirstPassGroupingCollector.class.isAssignableFrom(firstPassGroupingCollector.getClass())) {
-      Collection<SearchGroup<BytesRef>> searchGroups = firstPassGroupingCollector.getTopGroups(groupOffset, fillSortFields);
+      Collection<SearchGroup<BytesRef>> searchGroups = ((AbstractFirstPassGroupingCollector)firstPassGroupingCollector).getTopGroups(groupOffset, fillSortFields);
+      return new TermSecondPassGroupingCollector(groupField, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup , getScores, getMaxScores, fillSortFields);
+    } else if (DocScoresFirstPassGroupingCollector.class.isAssignableFrom(firstPassGroupingCollector.getClass())) {
+      Collection<SearchGroup<BytesRef>> searchGroups = ((DocScoresFirstPassGroupingCollector)firstPassGroupingCollector).getTopGroups(groupOffset, fillSortFields);
       return new TermSecondPassGroupingCollector(groupField, searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup , getScores, getMaxScores, fillSortFields);
     } else {
       ValueSource vs = new BytesRefFieldSource(groupField);
-      Collection<SearchGroup<MutableValue>> searchGroups = firstPassGroupingCollector.getTopGroups(groupOffset, fillSortFields);
+      Collection<SearchGroup<MutableValue>> searchGroups = ((AbstractFirstPassGroupingCollector)firstPassGroupingCollector).getTopGroups(groupOffset, fillSortFields);
       return new FunctionSecondPassGroupingCollector(searchGroups, groupSort, sortWithinGroup, maxDocsPerGroup, getScores, getMaxScores, fillSortFields, vs, new HashMap());
     }
   }
